@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +37,7 @@ const (
 	cursorAPIURL            = "https://api2.cursor.sh"
 	cursorRunPath           = "/agent.v1.AgentService/Run"
 	cursorModelsPath        = "/agent.v1.AgentService/GetUsableModels"
-	cursorClientVersion     = "anthropic-proxy"
+	cursorClientVersion     = "cli-2026.02.13-41ac335"
 	cursorAuthType          = "cursor"
 	cursorHeartbeatInterval = 5 * time.Second
 	cursorSessionTTL        = 5 * time.Minute
@@ -653,6 +655,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		usage.setInputEstimate(len(payload))
 
 		var ce *claudeStreamEmitter
+		messageStartSent := false
 		if claudeNative {
 			msgID := "msg_" + uuid.New().String()
 			ce = &claudeStreamEmitter{
@@ -660,12 +663,18 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				model: requestedModel,
 				emit:  func(data []byte) { emitToOut(cliproxyexecutor.StreamChunk{Payload: data}) },
 			}
-			ce.messageStart()
+		}
+		ensureMessageStart := func() {
+			if claudeNative && !messageStartSent {
+				messageStartSent = true
+				ce.messageStart()
+			}
 		}
 
 		streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, params.McpTools,
 			func(text string, isThinking bool) {
 				if claudeNative {
+					ensureMessageStart()
 					if isThinking {
 						if !thinkingActive {
 							thinkingActive = true
@@ -701,6 +710,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			},
 			func(exec pendingMcpExec) {
 				if claudeNative {
+					ensureMessageStart()
 					if thinkingActive {
 						thinkingActive = false
 						ce.blockStop()
@@ -804,6 +814,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 		inputTok, outputTok := usage.get()
 		if claudeNative {
+			ensureMessageStart()
 			if thinkingActive {
 				ce.blockStop()
 			}
@@ -894,6 +905,49 @@ func (e *CursorExecutor) resumeWithToolResults(
 
 // --- H2Stream helpers ---
 
+func cursorChecksum(token string) string {
+	ts := time.Now().UnixMilli() / 1e6
+	buf := [6]byte{
+		byte(ts >> 40), byte(ts >> 32), byte(ts >> 24),
+		byte(ts >> 16), byte(ts >> 8), byte(ts),
+	}
+	t := byte(165)
+	for i := range buf {
+		buf[i] = (buf[i] ^ t) + byte(i%2)
+		t = buf[i]
+	}
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	var encoded strings.Builder
+	for i := 0; i < len(buf); i += 3 {
+		a := buf[i]
+		b, c := byte(0), byte(0)
+		if i+1 < len(buf) {
+			b = buf[i+1]
+		}
+		if i+2 < len(buf) {
+			c = buf[i+2]
+		}
+		encoded.WriteByte(alphabet[a>>2])
+		encoded.WriteByte(alphabet[((a&3)<<4)|(b>>4)])
+		if i+1 < len(buf) {
+			encoded.WriteByte(alphabet[((b&15)<<2)|(c>>6)])
+		}
+		if i+2 < len(buf) {
+			encoded.WriteByte(alphabet[c&63])
+		}
+	}
+	machineID := fmt.Sprintf("%x", sha256.Sum256([]byte(token+"machineId")))
+	return encoded.String() + machineID
+}
+
+func cursorClientKey(token string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(token)))
+}
+
+func cursorSessionID(token string) string {
+	return uuid.NewSHA1(uuid.NameSpaceDNS, []byte(token)).String()
+}
+
 func openCursorH2Stream(accessToken string) (*cursorproto.H2Stream, error) {
 	headers := map[string]string{
 		":path":                    cursorRunPath,
@@ -902,12 +956,43 @@ func openCursorH2Stream(accessToken string) (*cursorproto.H2Stream, error) {
 		"te":                       "trailers",
 		"authorization":            "Bearer " + accessToken,
 		"x-ghost-mode":             "true",
-		"x-verified-ghost-mode":    "true",
 		"x-cursor-client-version":  cursorClientVersion,
-		"x-cursor-client-type":     "vscode",
+		"x-cursor-client-type":     "cli",
 		"x-request-id":             uuid.New().String(),
 	}
 	return cursorproto.DialH2Stream("api2.cursor.sh", headers)
+}
+
+func normalizeArch(goarch string) string {
+	switch goarch {
+	case "amd64":
+		return "x64"
+	case "arm64":
+		return "arm64"
+	default:
+		return goarch
+	}
+}
+
+func osVersion() string {
+	var buf [256]byte
+	// Use uname-like fallback
+	return strings.TrimSpace(func() string {
+		v := runtime.Version()
+		if v != "" {
+			return v
+		}
+		_ = buf
+		return "unknown"
+	}())
+}
+
+func cursorTimezone() string {
+	name, _ := time.Now().Zone()
+	if tz := os.Getenv("TZ"); tz != "" {
+		return tz
+	}
+	return name
 }
 
 func cursorH2Heartbeat(ctx context.Context, stream *cursorproto.H2Stream) {
