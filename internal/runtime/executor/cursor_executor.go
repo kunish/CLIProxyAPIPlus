@@ -21,11 +21,13 @@ import (
 	cursorproto "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/cursor/proto"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"golang.org/x/net/http2"
 )
 
@@ -320,8 +322,8 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	defer sessionCancel()
 	go cursorH2Heartbeat(sessionCtx, stream)
 
-	// Collect full text and tool calls from streaming response
-	var fullText strings.Builder
+	// Collect full text, thinking, and tool calls from streaming response
+	var textBuf, thinkBuf strings.Builder
 	type nonStreamToolCall struct {
 		id   string
 		name string
@@ -330,7 +332,11 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	var toolCalls []nonStreamToolCall
 	if streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, params.McpTools,
 		func(text string, isThinking bool) {
-			fullText.WriteString(text)
+			if isThinking {
+				thinkBuf.WriteString(text)
+			} else {
+				textBuf.WriteString(text)
+			}
 		},
 		func(exec pendingMcpExec) {
 			toolCalls = append(toolCalls, nonStreamToolCall{
@@ -342,13 +348,41 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		nil,
 		nil, // tokenUsage - non-streaming
 		nil, // onCheckpoint - non-streaming doesn't persist
-	); streamErr != nil && fullText.Len() == 0 && len(toolCalls) == 0 {
+	); streamErr != nil && textBuf.Len() == 0 && thinkBuf.Len() == 0 && len(toolCalls) == 0 {
 		return resp, classifyCursorError(fmt.Errorf("cursor: stream error: %w", streamErr))
+	}
+
+	requestedModel := helps.PayloadRequestedModel(opts, parsed.Model)
+	msgID := "msg_" + uuid.New().String()
+
+	if from.String() == "claude" {
+		out := []byte(fmt.Sprintf(`{"id":"%s","type":"message","role":"assistant","model":"%s","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`,
+			msgID, requestedModel))
+		if thinkBuf.Len() > 0 {
+			block := fmt.Sprintf(`{"type":"thinking","thinking":%s}`, jsonString(thinkBuf.String()))
+			out, _ = sjson.SetRawBytes(out, "content.-1", []byte(block))
+		}
+		if textBuf.Len() > 0 {
+			block := fmt.Sprintf(`{"type":"text","text":%s}`, jsonString(textBuf.String()))
+			out, _ = sjson.SetRawBytes(out, "content.-1", []byte(block))
+		}
+		for _, tc := range toolCalls {
+			block := fmt.Sprintf(`{"type":"tool_use","id":"%s","name":"%s","input":%s}`, tc.id, tc.name, tc.args)
+			out, _ = sjson.SetRawBytes(out, "content.-1", []byte(block))
+		}
+		if len(toolCalls) > 0 {
+			out, _ = sjson.SetBytes(out, "stop_reason", "tool_use")
+		}
+		resp.Payload = out
+		return resp, nil
 	}
 
 	id := "chatcmpl-" + uuid.New().String()[:28]
 	created := time.Now().Unix()
-
+	fullText := textBuf.String()
+	if thinkBuf.Len() > 0 {
+		fullText = thinkBuf.String() + fullText
+	}
 	var openaiResp string
 	if len(toolCalls) > 0 {
 		tcJSON := "["
@@ -361,17 +395,15 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		tcJSON += "]"
 		contentField := "null"
-		if fullText.Len() > 0 {
-			contentField = jsonString(fullText.String())
+		if fullText != "" {
+			contentField = jsonString(fullText)
 		}
 		openaiResp = fmt.Sprintf(`{"id":"%s","object":"chat.completion","created":%d,"model":"%s","choices":[{"index":0,"message":{"role":"assistant","content":%s,"tool_calls":%s},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
 			id, created, parsed.Model, contentField, tcJSON)
 	} else {
 		openaiResp = fmt.Sprintf(`{"id":"%s","object":"chat.completion","created":%d,"model":"%s","choices":[{"index":0,"message":{"role":"assistant","content":%s},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
-			id, created, parsed.Model, jsonString(fullText.String()))
+			id, created, parsed.Model, jsonString(fullText))
 	}
-
-	// Translate response back to source format if needed
 	result := []byte(openaiResp)
 	if from.String() != "" && from.String() != "openai" {
 		var param any
@@ -549,17 +581,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	chunks := make(chan cliproxyexecutor.StreamChunk, 64)
 	chatId := "chatcmpl-" + uuid.New().String()[:28]
 	created := time.Now().Unix()
+	requestedModel := helps.PayloadRequestedModel(opts, parsed.Model)
 
 	var streamParam any
 
-	// Tool result channel for inline mode. processH2SessionFrames blocks on it
-	// when mcpArgs is received, while continuing to handle KV/heartbeat.
 	toolResultCh := make(chan []toolResultInfo, 1)
 
-	// Switchable output: initially writes to `chunks`. After mcpArgs, the
-	// onMcpExec callback closes `chunks` (ending the first HTTP response),
-	// then processH2SessionFrames blocks on toolResultCh. When results arrive,
-	// it switches to `resumeOutCh` (created by resumeWithToolResults).
 	var outMu sync.Mutex
 	currentOut := chunks
 
@@ -572,7 +599,8 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 	}
 
-	// Wrap sendChunk/sendDone to use emitToOut
+	claudeNative := from.String() == "claude"
+
 	sendChunkSwitchable := func(delta string, finishReason string) {
 		fr := "null"
 		if finishReason != "" {
@@ -603,11 +631,8 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 	}
 
-	// Pre-response error detection for transparent failover:
-	// If the stream fails before any chunk is emitted (e.g. quota exceeded),
-	// ExecuteStream returns an error so the conductor retries with a different auth.
 	streamErrCh := make(chan error, 1)
-	firstChunkSent := make(chan struct{}, 1) // buffered: goroutine won't block signaling
+	firstChunkSent := make(chan struct{}, 1)
 
 	origEmitToOut := emitToOut
 	emitToOut = func(chunk cliproxyexecutor.StreamChunk) {
@@ -622,39 +647,87 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var resumeOutCh chan cliproxyexecutor.StreamChunk
 		_ = resumeOutCh
 		thinkingActive := false
+		textActive := false
 		toolCallIndex := 0
 		usage := &cursorTokenUsage{}
 		usage.setInputEstimate(len(payload))
 
+		var ce *claudeStreamEmitter
+		if claudeNative {
+			msgID := "msg_" + uuid.New().String()
+			ce = &claudeStreamEmitter{
+				msgID: msgID,
+				model: requestedModel,
+				emit:  func(data []byte) { emitToOut(cliproxyexecutor.StreamChunk{Payload: data}) },
+			}
+			ce.messageStart()
+		}
+
 		streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, params.McpTools,
 			func(text string, isThinking bool) {
-				if isThinking {
-					if !thinkingActive {
-						thinkingActive = true
-						sendChunkSwitchable(`{"role":"assistant","content":"<think>"}`, "")
+				if claudeNative {
+					if isThinking {
+						if !thinkingActive {
+							thinkingActive = true
+							ce.thinkingStart()
+						}
+						ce.thinkingDelta(text)
+					} else {
+						if thinkingActive {
+							thinkingActive = false
+							ce.blockStop()
+						}
+						if !textActive {
+							textActive = true
+							ce.textStart()
+						}
+						ce.textDelta(text)
 					}
-					sendChunkSwitchable(fmt.Sprintf(`{"content":%s}`, jsonString(text)), "")
+				} else {
+					if isThinking {
+						if !thinkingActive {
+							thinkingActive = true
+							sendChunkSwitchable(`{"role":"assistant","content":"<think>"}`, "")
+						}
+						sendChunkSwitchable(fmt.Sprintf(`{"content":%s}`, jsonString(text)), "")
+					} else {
+						if thinkingActive {
+							thinkingActive = false
+							sendChunkSwitchable(`{"content":"</think>"}`, "")
+						}
+						sendChunkSwitchable(fmt.Sprintf(`{"content":%s}`, jsonString(text)), "")
+					}
+				}
+			},
+			func(exec pendingMcpExec) {
+				if claudeNative {
+					if thinkingActive {
+						thinkingActive = false
+						ce.blockStop()
+					}
+					if textActive {
+						textActive = false
+						ce.blockStop()
+					}
+					ce.toolUseStart(exec.ToolCallId, exec.ToolName)
+					ce.toolUseDelta(exec.Args)
+					ce.blockStop()
+					inputTok, outputTok := usage.get()
+					ce.messageDelta("tool_use", inputTok, outputTok)
+					ce.messageStop()
 				} else {
 					if thinkingActive {
 						thinkingActive = false
 						sendChunkSwitchable(`{"content":"</think>"}`, "")
 					}
-					sendChunkSwitchable(fmt.Sprintf(`{"content":%s}`, jsonString(text)), "")
+					toolCallJSON := fmt.Sprintf(`{"tool_calls":[{"index":%d,"id":"%s","type":"function","function":{"name":"%s","arguments":%s}}]}`,
+						toolCallIndex, exec.ToolCallId, exec.ToolName, jsonString(exec.Args))
+					toolCallIndex++
+					sendChunkSwitchable(toolCallJSON, "")
+					sendChunkSwitchable(`{}`, `"tool_calls"`)
+					sendDoneSwitchable()
 				}
-			},
-			func(exec pendingMcpExec) {
-				if thinkingActive {
-					thinkingActive = false
-					sendChunkSwitchable(`{"content":"</think>"}`, "")
-				}
-				toolCallJSON := fmt.Sprintf(`{"tool_calls":[{"index":%d,"id":"%s","type":"function","function":{"name":"%s","arguments":%s}}]}`,
-					toolCallIndex, exec.ToolCallId, exec.ToolName, jsonString(exec.Args))
-				toolCallIndex++
-				sendChunkSwitchable(toolCallJSON, "")
-				sendChunkSwitchable(`{}`, `"tool_calls"`)
-				sendDoneSwitchable()
 
-				// Close current output to end the current HTTP SSE response
 				outMu.Lock()
 				if currentOut != nil {
 					close(currentOut)
@@ -662,7 +735,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				outMu.Unlock()
 
-				// Create new resume output channel, reuse the same toolResultCh
 				resumeOut := make(chan cliproxyexecutor.StreamChunk, 64)
 				log.Debugf("cursor: saving session %s for MCP tool resume (tool=%s)", sessionKey, exec.ToolName)
 				e.mu.Lock()
@@ -674,30 +746,31 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					cancel:       sessionCancel,
 					createdAt:    time.Now(),
 					authID:       authID,
-					toolResultCh: toolResultCh, // reuse same channel across rounds
+					toolResultCh: toolResultCh,
 					resumeOutCh:  resumeOut,
 					switchOutput: func(ch chan cliproxyexecutor.StreamChunk) {
 						outMu.Lock()
 						currentOut = ch
-						// Reset translator state so the new HTTP response gets
-						// a fresh message_start, content_block_start, etc.
 						streamParam = nil
-						// New response needs its own message ID
 						chatId = "chatcmpl-" + uuid.New().String()[:28]
 						created = time.Now().Unix()
+						if claudeNative {
+							ce = &claudeStreamEmitter{
+								msgID: "msg_" + uuid.New().String(),
+								model: requestedModel,
+								emit:  func(data []byte) { emitToOut(cliproxyexecutor.StreamChunk{Payload: data}) },
+							}
+							ce.messageStart()
+						}
 						outMu.Unlock()
 					},
 				}
 				e.mu.Unlock()
 				resumeOutCh = resumeOut
-
-				// processH2SessionFrames will now block on toolResultCh (inline wait loop)
-				// while continuing to handle KV messages
 			},
 			toolResultCh,
 			usage,
 			func(cpData []byte) {
-				// Save checkpoint keyed by conversationId, tagged with authID for migration detection
 				e.mu.Lock()
 				e.checkpoints[checkpointKey] = &savedCheckpoint{
 					data:      cpData,
@@ -710,16 +783,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			},
 		)
 
-		// processH2SessionFrames returned — stream is done.
-		// Check if error happened before any chunks were emitted.
 		if streamErr != nil {
 			select {
 			case <-firstChunkSent:
-				// Chunks were already sent to client — can't transparently retry.
-				// Next request will failover via conductor's cooldown mechanism.
 				log.Warnf("cursor: stream error after data sent (auth=%s conv=%s): %v", authID, conversationId, streamErr)
 			default:
-				// No data sent yet — propagate error for transparent conductor retry.
 				log.Warnf("cursor: stream error before data sent (auth=%s conv=%s): %v — signaling retry", authID, conversationId, streamErr)
 				streamErrCh <- streamErr
 				outMu.Lock()
@@ -734,30 +802,35 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 
-		if thinkingActive {
-			sendChunkSwitchable(`{"content":"</think>"}`, "")
-		}
-		// Include token usage in the final stop chunk
 		inputTok, outputTok := usage.get()
-		stopDelta := fmt.Sprintf(`{},"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}`,
-			inputTok, outputTok, inputTok+outputTok)
-		// Build the stop chunk with usage embedded in the choices array level
-		fr := `"stop"`
-		openaiJSON := fmt.Sprintf(`{"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":%s}],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
-			chatId, created, parsed.Model, fr, inputTok, outputTok, inputTok+outputTok)
-		sseLine := []byte("data: " + openaiJSON + "\n")
-		if needsTranslate {
-			translated := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, payload, sseLine, &streamParam)
-			for _, t := range translated {
-				emitToOut(cliproxyexecutor.StreamChunk{Payload: bytes.Clone(t)})
+		if claudeNative {
+			if thinkingActive {
+				ce.blockStop()
 			}
+			if textActive {
+				ce.blockStop()
+			}
+			ce.messageDelta("end_turn", inputTok, outputTok)
+			ce.messageStop()
 		} else {
-			emitToOut(cliproxyexecutor.StreamChunk{Payload: []byte(openaiJSON)})
+			if thinkingActive {
+				sendChunkSwitchable(`{"content":"</think>"}`, "")
+			}
+			fr := `"stop"`
+			openaiJSON := fmt.Sprintf(`{"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":%s}],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
+				chatId, created, parsed.Model, fr, inputTok, outputTok, inputTok+outputTok)
+			sseLine := []byte("data: " + openaiJSON + "\n")
+			if needsTranslate {
+				translated := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, payload, sseLine, &streamParam)
+				for _, t := range translated {
+					emitToOut(cliproxyexecutor.StreamChunk{Payload: bytes.Clone(t)})
+				}
+			} else {
+				emitToOut(cliproxyexecutor.StreamChunk{Payload: []byte(openaiJSON)})
+			}
+			sendDoneSwitchable()
 		}
-		sendDoneSwitchable()
-		_ = stopDelta // unused
 
-		// Close whatever output channel is still active
 		outMu.Lock()
 		if currentOut != nil {
 			close(currentOut)
@@ -1754,4 +1827,76 @@ func consumeFieldValue(num, typ int, b []byte) int {
 	default:
 		return -1
 	}
+}
+
+// claudeSSE formats a Claude-protocol SSE event.
+func claudeSSE(event string, data []byte) []byte {
+	out := make([]byte, 0, len(event)+len(data)+20)
+	out = append(out, "event: "...)
+	out = append(out, event...)
+	out = append(out, '\n')
+	out = append(out, "data: "...)
+	out = append(out, data...)
+	out = append(out, '\n', '\n')
+	return out
+}
+
+// claudeStreamEmitter generates Anthropic-compliant SSE events directly.
+type claudeStreamEmitter struct {
+	msgID      string
+	model      string
+	blockIndex int
+	emit       func(data []byte)
+}
+
+func (e *claudeStreamEmitter) messageStart() {
+	data := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":"%s","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`,
+		e.msgID, e.model)
+	e.emit(claudeSSE("message_start", []byte(data)))
+}
+
+func (e *claudeStreamEmitter) thinkingStart() {
+	data := fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, e.blockIndex)
+	e.emit(claudeSSE("content_block_start", []byte(data)))
+}
+
+func (e *claudeStreamEmitter) thinkingDelta(text string) {
+	data := fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":%s}}`, e.blockIndex, jsonString(text))
+	e.emit(claudeSSE("content_block_delta", []byte(data)))
+}
+
+func (e *claudeStreamEmitter) textStart() {
+	data := fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, e.blockIndex)
+	e.emit(claudeSSE("content_block_start", []byte(data)))
+}
+
+func (e *claudeStreamEmitter) textDelta(text string) {
+	data := fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, e.blockIndex, jsonString(text))
+	e.emit(claudeSSE("content_block_delta", []byte(data)))
+}
+
+func (e *claudeStreamEmitter) toolUseStart(toolID, name string) {
+	data := fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"%s","name":"%s","input":{}}}`, e.blockIndex, toolID, name)
+	e.emit(claudeSSE("content_block_start", []byte(data)))
+}
+
+func (e *claudeStreamEmitter) toolUseDelta(argsJSON string) {
+	data := fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%s}}`, e.blockIndex, jsonString(argsJSON))
+	e.emit(claudeSSE("content_block_delta", []byte(data)))
+}
+
+func (e *claudeStreamEmitter) blockStop() {
+	data := fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, e.blockIndex)
+	e.emit(claudeSSE("content_block_stop", []byte(data)))
+	e.blockIndex++
+}
+
+func (e *claudeStreamEmitter) messageDelta(stopReason string, inputTokens, outputTokens int64) {
+	data := fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"input_tokens":%d,"output_tokens":%d}}`,
+		stopReason, inputTokens, outputTokens)
+	e.emit(claudeSSE("message_delta", []byte(data)))
+}
+
+func (e *claudeStreamEmitter) messageStop() {
+	e.emit(claudeSSE("message_stop", []byte(`{"type":"message_stop"}`)))
 }
