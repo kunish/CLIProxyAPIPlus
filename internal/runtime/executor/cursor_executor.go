@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"errors"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,14 +30,14 @@ import (
 )
 
 const (
-	cursorAPIURL        = "https://api2.cursor.sh"
-	cursorRunPath       = "/agent.v1.AgentService/Run"
-	cursorModelsPath    = "/agent.v1.AgentService/GetUsableModels"
-	cursorClientVersion = "cli-2026.02.13-41ac335"
-	cursorAuthType      = "cursor"
+	cursorAPIURL            = "https://api2.cursor.sh"
+	cursorRunPath           = "/agent.v1.AgentService/Run"
+	cursorModelsPath        = "/agent.v1.AgentService/GetUsableModels"
+	cursorClientVersion     = "cli-2026.02.13-41ac335"
+	cursorAuthType          = "cursor"
 	cursorHeartbeatInterval = 5 * time.Second
-	cursorSessionTTL      = 5 * time.Minute
-	cursorCheckpointTTL   = 30 * time.Minute
+	cursorSessionTTL        = 5 * time.Minute
+	cursorCheckpointTTL     = 30 * time.Minute
 )
 
 // CursorExecutor handles requests to the Cursor API via Connect+Protobuf protocol.
@@ -63,9 +63,9 @@ type cursorSession struct {
 	pending      []pendingMcpExec
 	cancel       context.CancelFunc // cancels the session-scoped heartbeat (NOT tied to HTTP request)
 	createdAt    time.Time
-	authID       string // auth file ID that created this session (for multi-account isolation)
-	toolResultCh chan []toolResultInfo                // receives tool results from the next HTTP request
-	resumeOutCh  chan cliproxyexecutor.StreamChunk    // output channel for resumed response
+	authID       string                                     // auth file ID that created this session (for multi-account isolation)
+	toolResultCh chan []toolResultInfo                      // receives tool results from the next HTTP request
+	resumeOutCh  chan cliproxyexecutor.StreamChunk          // output channel for resumed response
 	switchOutput func(ch chan cliproxyexecutor.StreamChunk) // callback to switch output channel
 }
 
@@ -148,7 +148,7 @@ type cursorStatusErr struct {
 	msg  string
 }
 
-func (e cursorStatusErr) Error() string             { return e.msg }
+func (e cursorStatusErr) Error() string              { return e.msg }
 func (e cursorStatusErr) StatusCode() int            { return e.code }
 func (e cursorStatusErr) RetryAfter() *time.Duration { return nil } // no retry-after info from Cursor; conductor uses exponential backoff
 
@@ -317,24 +317,56 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	defer sessionCancel()
 	go cursorH2Heartbeat(sessionCtx, stream)
 
-	// Collect full text from streaming response
+	// Collect full text and tool calls from streaming response
 	var fullText strings.Builder
-	if streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, nil,
+	type nonStreamToolCall struct {
+		id   string
+		name string
+		args string
+	}
+	var toolCalls []nonStreamToolCall
+	if streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, params.McpTools,
 		func(text string, isThinking bool) {
 			fullText.WriteString(text)
 		},
-		nil,
+		func(exec pendingMcpExec) {
+			toolCalls = append(toolCalls, nonStreamToolCall{
+				id:   exec.ToolCallId,
+				name: exec.ToolName,
+				args: exec.Args,
+			})
+		},
 		nil,
 		nil, // tokenUsage - non-streaming
 		nil, // onCheckpoint - non-streaming doesn't persist
-	); streamErr != nil && fullText.Len() == 0 {
+	); streamErr != nil && fullText.Len() == 0 && len(toolCalls) == 0 {
 		return resp, classifyCursorError(fmt.Errorf("cursor: stream error: %w", streamErr))
 	}
 
 	id := "chatcmpl-" + uuid.New().String()[:28]
 	created := time.Now().Unix()
-	openaiResp := fmt.Sprintf(`{"id":"%s","object":"chat.completion","created":%d,"model":"%s","choices":[{"index":0,"message":{"role":"assistant","content":%s},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
-		id, created, parsed.Model, jsonString(fullText.String()))
+
+	var openaiResp string
+	if len(toolCalls) > 0 {
+		tcJSON := "["
+		for i, tc := range toolCalls {
+			if i > 0 {
+				tcJSON += ","
+			}
+			tcJSON += fmt.Sprintf(`{"id":%s,"type":"function","function":{"name":%s,"arguments":%s}}`,
+				jsonString(tc.id), jsonString(tc.name), jsonString(tc.args))
+		}
+		tcJSON += "]"
+		contentField := "null"
+		if fullText.Len() > 0 {
+			contentField = jsonString(fullText.String())
+		}
+		openaiResp = fmt.Sprintf(`{"id":"%s","object":"chat.completion","created":%d,"model":"%s","choices":[{"index":0,"message":{"role":"assistant","content":%s,"tool_calls":%s},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
+			id, created, parsed.Model, contentField, tcJSON)
+	} else {
+		openaiResp = fmt.Sprintf(`{"id":"%s","object":"chat.completion","created":%d,"model":"%s","choices":[{"index":0,"message":{"role":"assistant","content":%s},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
+			id, created, parsed.Model, jsonString(fullText.String()))
+	}
 
 	// Translate response back to source format if needed
 	result := []byte(openaiResp)
@@ -786,7 +818,7 @@ func (e *CursorExecutor) resumeWithToolResults(
 func openCursorH2Stream(accessToken string) (*cursorproto.H2Stream, error) {
 	headers := map[string]string{
 		":path":                    cursorRunPath,
-		"content-type":            "application/connect+proto",
+		"content-type":             "application/connect+proto",
 		"connect-protocol-version": "1",
 		"te":                       "trailers",
 		"authorization":            "Bearer " + accessToken,
@@ -876,21 +908,21 @@ func processH2SessionFrames(
 			buf.Write(data)
 			log.Debugf("cursor: processH2SessionFrames[%s]: buf total=%d", stream.ID(), buf.Len())
 
-		// Process all complete frames
-		for {
-			currentBuf := buf.Bytes()
-			if len(currentBuf) == 0 {
-				break
-			}
-			flags, payload, consumed, ok := cursorproto.ParseConnectFrame(currentBuf)
-			if !ok {
-				// Log detailed info about why parsing failed
-				previewLen := min(20, len(currentBuf))
-				log.Debugf("cursor: incomplete frame in buffer, waiting for more data (buf=%d bytes, first bytes: %x = %q)", len(currentBuf), currentBuf[:previewLen], string(currentBuf[:previewLen]))
-				break
-			}
-			buf.Next(consumed)
-			log.Debugf("cursor: parsed Connect frame flags=0x%02x payload=%d bytes consumed=%d", flags, len(payload), consumed)
+			// Process all complete frames
+			for {
+				currentBuf := buf.Bytes()
+				if len(currentBuf) == 0 {
+					break
+				}
+				flags, payload, consumed, ok := cursorproto.ParseConnectFrame(currentBuf)
+				if !ok {
+					// Log detailed info about why parsing failed
+					previewLen := min(20, len(currentBuf))
+					log.Debugf("cursor: incomplete frame in buffer, waiting for more data (buf=%d bytes, first bytes: %x = %q)", len(currentBuf), currentBuf[:previewLen], string(currentBuf[:previewLen]))
+					break
+				}
+				buf.Next(consumed)
+				log.Debugf("cursor: parsed Connect frame flags=0x%02x payload=%d bytes consumed=%d", flags, len(payload), consumed)
 
 				if flags&cursorproto.ConnectEndStreamFlag != 0 {
 					if err := cursorproto.ParseConnectEndStream(payload); err != nil {
@@ -1080,15 +1112,15 @@ func processH2SessionFrames(
 // --- OpenAI request parsing ---
 
 type parsedOpenAIRequest struct {
-	Model       string
-	Messages    []gjson.Result
-	Tools       []gjson.Result
-	Stream      bool
+	Model        string
+	Messages     []gjson.Result
+	Tools        []gjson.Result
+	Stream       bool
 	SystemPrompt string
-	UserText    string
-	Images      []cursorproto.ImageData
-	Turns       []cursorproto.TurnData
-	ToolResults []toolResultInfo
+	UserText     string
+	Images       []cursorproto.ImageData
+	Turns        []cursorproto.TurnData
+	ToolResults  []toolResultInfo
 }
 
 type toolResultInfo struct {
