@@ -35,7 +35,7 @@ const (
 	cursorAPIURL            = "https://api2.cursor.sh"
 	cursorRunPath           = "/agent.v1.AgentService/Run"
 	cursorModelsPath        = "/agent.v1.AgentService/GetUsableModels"
-	cursorClientVersion     = "cli-2026.02.13-41ac335"
+	cursorClientVersion     = "anthropic-proxy"
 	cursorAuthType          = "cursor"
 	cursorHeartbeatInterval = 5 * time.Second
 	cursorSessionTTL        = 5 * time.Minute
@@ -902,8 +902,9 @@ func openCursorH2Stream(accessToken string) (*cursorproto.H2Stream, error) {
 		"te":                       "trailers",
 		"authorization":            "Bearer " + accessToken,
 		"x-ghost-mode":             "true",
+		"x-verified-ghost-mode":    "true",
 		"x-cursor-client-version":  cursorClientVersion,
-		"x-cursor-client-type":     "cli",
+		"x-cursor-client-type":     "vscode",
 		"x-request-id":             uuid.New().String(),
 	}
 	return cursorproto.DialH2Stream("api2.cursor.sh", headers)
